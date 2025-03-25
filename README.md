@@ -25,11 +25,11 @@ No more wondering where your `.crt`, `.pem`, `.key`, or `.asc` files are hiding.
 
 ## 🚀 Installation & Usage
 
-1. Clone the repository:
+1️⃣ Clone the repository & run
 
 ```bash
-git clone https://github.com/yourusername/keynobi.git
+git clone https://github.com/CodeD-Roger/keynobi.git
 cd keynobi
-chmod +x keynobi.sh
+sudo chmod +x keynobi.sh
+./keynobi.sh
 ```
-
