@@ -12,9 +12,10 @@ TEMP_SSL="/tmp/ssl_certs_$$.txt"
 TEMP_SSH="/tmp/ssh_keys_$$.txt"
 TEMP_PGP="/tmp/pgp_keys_$$.txt"
 TEMP_ERRORS="/tmp/cert_errors_$$.txt"
+TEMP_WEB_CERTS="/tmp/web_certs_$$.txt"
 
 # Ensure temporary files are cleaned up on exit
-trap 'rm -f "$TEMP_SSL" "$TEMP_SSH" "$TEMP_PGP" "$TEMP_ERRORS"' EXIT
+trap 'rm -f "$TEMP_SSL" "$TEMP_SSH" "$TEMP_PGP" "$TEMP_ERRORS" "$TEMP_WEB_CERTS"' EXIT
 
 # Display functions
 display_title() {
@@ -141,6 +142,148 @@ scan_system() {
   echo -e "  PGP Keys: $pgp_count"
   if [ "$error_count" -gt 0 ]; then
     display_error "  Errors: $error_count (see $TEMP_ERRORS)"
+  fi
+}
+
+# Scan web services for certificates
+scan_web_services_certs() {
+  display_title "Web Services Certificate Scan"
+  > "$TEMP_WEB_CERTS"
+  > "$TEMP_ERRORS"
+
+  # Scan NGINX
+  display_info "Scanning NGINX configurations..."
+  nginx_conf="/etc/nginx/nginx.conf"
+  nginx_sites="/etc/nginx/sites-enabled/*"
+  if [ -f "$nginx_conf" ]; then
+    grep -h "ssl_certificate[^_]" "$nginx_conf" $nginx_sites 2>/dev/null | grep -v "#" | while IFS= read -r line; do
+      cert_file=$(echo "$line" | awk '{print $2}' | tr -d ';')
+      if [ -f "$cert_file" ]; then
+        echo "$cert_file" >> "$TEMP_WEB_CERTS"
+      else
+        echo "NGINX: $cert_file (file not found)" >> "$TEMP_ERRORS"
+      fi
+    done
+  else
+    display_info "No NGINX configuration found."
+  fi
+
+  # Scan Apache
+  display_info "Scanning Apache configurations..."
+  apache_conf="/etc/apache2/apache2.conf"
+  apache_sites="/etc/apache2/sites-enabled/*"
+  if [ -f "$apache_conf" ]; then
+    grep -h "SSLCertificateFile" "$apache_conf" $apache_sites 2>/dev/null | grep -v "#" | while IFS= read -r line; do
+      cert_file=$(echo "$line" | awk '{print $2}')
+      if [ -f "$cert_file" ]; then
+        echo "$cert_file" >> "$TEMP_WEB_CERTS"
+      else
+        echo "Apache: $cert_file (file not found)" >> "$TEMP_ERRORS"
+      fi
+    done
+  else
+    display_info "No Apache configuration found."
+  fi
+
+  # Scan Tomcat
+  display_info "Scanning Tomcat configurations..."
+  find / -type f -name "server.xml" 2>/dev/null | while IFS= read -r file; do
+    grep -h "certificateKeystoreFile" "$file" 2>/dev/null | grep -v "<!--" | while IFS= read -r line; do
+      cert_file=$(echo "$line" | grep -oP 'certificateKeystoreFile="\K[^"]+')
+      if [ -f "$cert_file" ]; then
+        echo "$cert_file" >> "$TEMP_WEB_CERTS"
+      else
+        echo "Tomcat: $cert_file (file not found)" >> "$TEMP_ERRORS"
+      fi
+    done
+  done
+
+  # Display results
+  display_web_certs_details
+}
+
+# Display web services certificates details
+display_web_certs_details() {
+  display_title "Web Services Certificates Details"
+  if [ -s "$TEMP_WEB_CERTS" ]; then
+    sort -u "$TEMP_WEB_CERTS" | while IFS= read -r file; do
+      echo -e "${YELLOW}Certificate:${NC} $(basename "$file")"
+      echo -e "${YELLOW}Path:${NC} $file"
+      subject="N/A"
+      issuer="N/A"
+      start_date="N/A"
+      end_date="N/A"
+      fingerprint="N/A"
+      status="Unknown"
+      if [[ "$file" == *.p12 ]]; then
+        if cert_data=$(openssl pkcs12 -in "$file" -nodes -nokeys -passin pass:"" 2>/dev/null); then
+          subject=$(echo "$cert_data" | openssl x509 -noout -subject 2>/dev/null | sed 's/subject=//')
+          issuer=$(echo "$cert_data" | openssl x509 -noout -issuer 2>/dev/null | sed 's/issuer=//')
+          start_date=$(echo "$cert_data" | openssl x509 -noout -startdate 2>/dev/null | sed 's/notBefore=//')
+          end_date=$(echo "$cert_data" | openssl x509 -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+          fingerprint=$(echo "$cert_data" | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/SHA256 Fingerprint=//')
+          if echo "$cert_data" | openssl x509 -noout -checkend 0 >/dev/null 2>&1; then
+            status="Valid"
+          else
+            status="Expired"
+          fi
+        fi
+      else
+        subject=$(openssl x509 -in "$file" -noout -subject 2>/dev/null | sed 's/subject=//')
+        issuer=$(openssl x509 -in "$file" -noout -issuer 2>/dev/null | sed 's/issuer=//')
+        start_date=$(openssl x509 -in "$file" -noout -startdate 2>/dev/null | sed 's/notBefore=//')
+        end_date=$(openssl x509 -in "$file" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+        fingerprint=$(openssl x509 -in "$file" -noout -fingerprint -sha256 2>/dev/null | sed 's/SHA256 Fingerprint=//')
+        if openssl x509 -in "$file" -noout -checkend 0 >/dev/null 2>&1; then
+          status="Valid"
+        else
+          status="Expired"
+        fi
+      fi
+      echo -e "${YELLOW}Subject:${NC} ${subject:-N/A}"
+      echo -e "${YELLOW}Issuer:${NC} ${issuer:-N/A}"
+      echo -e "${YELLOW}Valid From:${NC} ${start_date:-N/A}"
+      echo -e "${YELLOW}Valid To:${NC} ${end_date:-N/A}"
+      echo -e "${YELLOW}Fingerprint:${NC} sha256 Fingerprint=${fingerprint:-N/A}"
+      echo -e "${YELLOW}Status:${NC} $status"
+      echo
+    done
+  else
+    echo "No web service certificates found."
+  fi
+}
+
+# Scan remote certificate
+scan_remote_cert() {
+  display_title "Remote Certificate Scan"
+  read -p "Enter domain or IP address: " target
+  read -p "Enter port [default 443]: " port
+  port=${port:-443}
+
+  display_info "Attempting to connect to $target:$port..."
+  local temp_cert="/tmp/remote_cert_$$.pem"
+  if timeout 10 openssl s_client -connect "$target:$port" -servername "$target" </dev/null 2>/dev/null | openssl x509 > "$temp_cert" 2>/dev/null; then
+    display_success "Certificate retrieved!"
+    echo -e "${YELLOW}Target:${NC} $target:$port"
+    subject=$(openssl x509 -in "$temp_cert" -noout -subject 2>/dev/null | sed 's/subject=//')
+    issuer=$(openssl x509 -in "$temp_cert" -noout -issuer 2>/dev/null | sed 's/issuer=//')
+    start_date=$(openssl x509 -in "$temp_cert" -noout -startdate 2>/dev/null | sed 's/notBefore=//')
+    end_date=$(openssl x509 -in "$temp_cert" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+    fingerprint=$(openssl x509 -in "$temp_cert" -noout -fingerprint -sha256 2>/dev/null | sed 's/SHA256 Fingerprint=//')
+    if openssl x509 -in "$temp_cert" -noout -checkend 0 >/dev/null 2>&1; then
+      status="Valid"
+    else
+      status="Expired"
+    fi
+    echo -e "${YELLOW}Subject:${NC} ${subject:-N/A}"
+    echo -e "${YELLOW}Issuer:${NC} ${issuer:-N/A}"
+    echo -e "${YELLOW}Valid From:${NC} ${start_date:-N/A}"
+    echo -e "${YELLOW}Valid To:${NC} ${end_date:-N/A}"
+    echo -e "${YELLOW}Fingerprint:${NC} sha256 Fingerprint=${fingerprint:-N/A}"
+    echo -e "${YELLOW}Status:${NC} $status"
+    rm -f "$temp_cert"
+  else
+    display_error "Failed to retrieve certificate from $target:$port (connection error or timeout)"
   fi
 }
 
@@ -298,7 +441,9 @@ main_menu() {
     echo "5. Filter SSL"
     echo "6. All"
     echo "7. Exit"
-    read -p "Choice [1-7]: " choice
+    echo "8. Services Web Locaux"
+    echo "9. Certificats Distants (DNS/IP)"
+    read -p "Choice [1-9]: " choice
     case $choice in
       1)
         display_directories "$TEMP_SSL" "SSL/TLS"
@@ -331,8 +476,14 @@ main_menu() {
         display_success "Exiting..."
         exit 0
         ;;
+      8)
+        scan_web_services_certs
+        ;;
+      9)
+        scan_remote_cert
+        ;;
       *)
-        display_error "Invalid choice. Please select 1-7."
+        display_error "Invalid choice. Please select 1-9."
         ;;
     esac
     read -p "Press Enter to continue..."
