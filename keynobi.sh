@@ -13,9 +13,13 @@ TEMP_SSH="/tmp/ssh_keys_$$.txt"
 TEMP_PGP="/tmp/pgp_keys_$$.txt"
 TEMP_ERRORS="/tmp/cert_errors_$$.txt"
 TEMP_WEB_CERTS="/tmp/web_certs_$$.txt"
+TEMP_SERVICES="/tmp/services_443_$$.txt"
+TEMP_USED_CERTS="/tmp/used_certs_$$.txt"
+TEMP_ALL_CERTS="/tmp/all_certs_$$.txt"
+TEMP_AUDIT="/tmp/audit_summary_$$.txt"
 
 # Ensure temporary files are cleaned up on exit
-trap 'rm -f "$TEMP_SSL" "$TEMP_SSH" "$TEMP_PGP" "$TEMP_ERRORS" "$TEMP_WEB_CERTS"' EXIT
+trap 'rm -f "$TEMP_SSL" "$TEMP_SSH" "$TEMP_PGP" "$TEMP_ERRORS" "$TEMP_WEB_CERTS" "$TEMP_SERVICES" "$TEMP_USED_CERTS" "$TEMP_ALL_CERTS" "$TEMP_AUDIT"' EXIT
 
 # Display functions
 display_title() {
@@ -76,6 +80,7 @@ scan_system() {
   > "$TEMP_SSH"
   > "$TEMP_PGP"
   > "$TEMP_ERRORS"
+  > "$TEMP_ALL_CERTS"
 
   # Define directories to exclude
   local exclude_paths="-not -path '/proc/*' -not -path '/sys/*' -not -path '/dev/*' -not -path '/run/*'"
@@ -87,12 +92,14 @@ scan_system() {
       # Try to extract certificate from PKCS#12
       if openssl pkcs12 -in "$file" -nodes -nokeys -passin pass:"" | openssl x509 -noout >/dev/null 2>&1; then
         echo "$file" >> "$TEMP_SSL"
+        echo "$file (PKCS#12)" >> "$TEMP_ALL_CERTS"
       else
         error_msg=$(openssl pkcs12 -in "$file" -nodes -nokeys -passin pass:"" 2>&1)
         echo "SSL: $file (invalid PKCS#12 format: $error_msg)" >> "$TEMP_ERRORS"
       fi
     elif openssl x509 -in "$file" -noout >/dev/null 2>&1; then
       echo "$file" >> "$TEMP_SSL"
+      echo "$file (Certificate)" >> "$TEMP_ALL_CERTS"
     else
       error_msg=$(openssl x509 -in "$file" -noout 2>&1)
       echo "SSL: $file (invalid format: $error_msg)" >> "$TEMP_ERRORS"
@@ -114,7 +121,7 @@ scan_system() {
   done
 
   # Scan PGP keys
-  display_info "Searching for PGP keys..."
+  display_info " searching for PGP keys..."
   find "$SCAN_DIR" -type f \( -name "*.gpg" -o -name "*.asc" \) $exclude_paths 2>/dev/null | while IFS= read -r file; do
     if gpg --list-packets "$file" >/dev/null 2>&1; then
       echo "$file" >> "$TEMP_PGP"
@@ -419,6 +426,258 @@ display_pgp_details() {
   fi
 }
 
+# Detect services listening on port 443 and their associated certificates
+detect_services_443() {
+  display_title "Detecting Services on Port 443"
+  > "$TEMP_SERVICES"
+  > "$TEMP_USED_CERTS"
+
+  # Use ss or netstat to find services listening on port 443
+  if command -v ss >/dev/null 2>&1; then
+    ss -tuln | grep ":443" | while IFS= read -r line; do
+      local pid=$(ss -tulp | grep ":443" | awk '{print $NF}' | grep -oP 'pid=\K[0-9]+')
+      if [ -n "$pid" ]; then
+        local binary=$(ps -p "$pid" -o comm= 2>/dev/null)
+        local cmdline=$(cat /proc/"$pid"/cmdline 2>/dev/null | tr '\0' ' ')
+        echo "PID: $pid, Binary: $binary, Cmdline: $cmdline" >> "$TEMP_SERVICES"
+        find_service_certs "$binary" "$pid" "$cmdline"
+      fi
+    done
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -tuln | grep ":443" | while IFS= read -r line; do
+      local pid=$(netstat -tulnp 2>/dev/null | grep ":443" | awk '{print $NF}' | cut -d'/' -f1)
+      if [ -n "$pid" ]; then
+        local binary=$(ps -p "$pid" -o comm= 2>/dev/null)
+        local cmdline=$(cat /proc/"$pid"/cmdline 2>/dev/null | tr '\0' ' ')
+        echo "PID: $pid, Binary: $binary, Cmdline: $cmdline" >> "$TEMP_SERVICES"
+        find_service_certs "$binary" "$pid" "$cmdline"
+      fi
+    done
+  else
+    display_error "Neither ss nor netstat is available. Cannot detect services."
+    return 1
+  fi
+
+  # Display results
+  if [ -s "$TEMP_SERVICES" ]; then
+    display_success "Services detected on port 443:"
+    nl -w2 -s". " "$TEMP_SERVICES"
+  else
+    display_info "No services found listening on port 443."
+  fi
+}
+
+# Find certificates used by a specific service
+find_service_certs() {
+  local binary="$1"
+  local pid="$2"
+  local cmdline="$3"
+  local cert_file=""
+
+  case "$binary" in
+    nginx)
+      local nginx_conf="/etc/nginx/nginx.conf"
+      local nginx_sites="/etc/nginx/sites-enabled/*"
+      if [ -f "$nginx_conf" ]; then
+        grep -h "ssl_certificate[^_]" "$nginx_conf" $nginx_sites 2>/dev/null | grep -v "#" | while IFS= read -r line; do
+          cert_file=$(echo "$line" | awk '{print $2}' | tr -d ';')
+          if [ -f "$cert_file" ]; then
+            echo "$cert_file" >> "$TEMP_USED_CERTS"
+          fi
+        done
+      fi
+      ;;
+    httpd | apache2)
+      local apache_conf="/etc/apache2/apache2.conf"
+      local apache_sites="/etc/apache2/sites-enabled/*"
+      if [ -f "$apache_conf" ]; then
+        grep -h "SSLCertificateFile" "$apache_conf" $apache_sites 2>/dev/null | grep -v "#" | while IFS= read -r line; do
+          cert_file=$(echo "$line" | awk '{print $2}')
+          if [ -f "$cert_file" ]; then
+            echo "$cert_file" >> "$TEMP_USED_CERTS"
+          fi
+        done
+      fi
+      ;;
+    java)
+      # Check for Tomcat or other Java-based services
+      find / -type f -name "server.xml" 2>/dev/null | while IFS= read -r file; do
+        grep -h "certificateKeystoreFile" "$file" 2>/dev/null | grep -v "<!--" | while IFS= read -r line; do
+          cert_file=$(echo "$line" | grep -oP 'certificateKeystoreFile="\K[^"]+')
+          if [ -f "$cert_file" ]; then
+            echo "$cert_file" >> "$TEMP_USED_CERTS"
+          fi
+        done
+      done
+      ;;
+    *)
+      display_info "Unknown binary $binary. Checking cmdline for certificate paths..."
+      echo "$cmdline" | grep -oP '\S+\.(crt|pem|p12)' | while IFS= read -r file; do
+        if [ -f "$file" ]; then
+          echo "$file" >> "$TEMP_USED_CERTS"
+        fi
+      done
+      ;;
+  esac
+}
+
+# Scan for all certificates and keys, including unused ones
+scan_all_certs() {
+  display_title "Scanning All Certificates and Keys"
+  > "$TEMP_ALL_CERTS"
+
+  local exclude_paths="-not -path '/proc/*' -not -path '/sys/*' -not -path '/dev/*' -not -path '/run/*'"
+  local search_dirs="/etc /opt"
+
+  # Search for certificates and keys with specific patterns
+  find $search_dirs -type f \( -name "*.crt" -o -name "*.pem" -o -name "*.cer" -o -name "*.p12" -o -name "*.key" \) $exclude_paths 2>/dev/null | while IFS= read -r file; do
+    # Filter files containing 'amj-groupe' or common certificate patterns
+    if strings "$file" 2>/dev/null | grep -qi "amj-groupe\|CERTIFICATE\|PRIVATE KEY"; then
+      if [[ "$file" == *.key ]]; then
+        if openssl rsa -in "$file" -noout 2>/dev/null || openssl ec -in "$file" -noout 2>/dev/null; then
+          echo "$file (Private Key)" >> "$TEMP_ALL_CERTS"
+        else
+          echo "Key: $file (invalid key format)" >> "$TEMP_ERRORS"
+        fi
+      elif [[ "$file" == *.p12 ]]; then
+        if openssl pkcs12 -in "$file" -nodes -nokeys -passin pass:"" | openssl x509 -noout >/dev/null 2>&1; then
+          echo "$file (PKCS#12)" >> "$TEMP_ALL_CERTS"
+        else
+          echo "PKCS#12: $file (invalid format)" >> "$TEMP_ERRORS"
+        fi
+      else
+        if openssl x509 -in "$file" -noout >/dev/null 2>&1; then
+          echo "$file (Certificate)" >> "$TEMP_ALL_CERTS"
+        else
+          echo "Certificate: $file (invalid format)" >> "$TEMP_ERRORS"
+        fi
+      fi
+    fi
+  done
+
+  # Display results
+  local all_count=$(wc -l < "$TEMP_ALL_CERTS")
+  display_success "Found $all_count certificates and keys."
+}
+
+# Compare used vs unused certificates
+compare_certs() {
+  display_title "Comparing Used vs Unused Certificates"
+  local temp_unused="/tmp/unused_certs_$$.txt"
+  > "$temp_unused"
+
+  # Find certificates in TEMP_ALL_CERTS but not in TEMP_USED_CERTS
+  sort "$TEMP_ALL_CERTS" | uniq | while IFS= read -r line; do
+    local file=$(echo "$line" | cut -d' ' -f1)
+    if ! grep -Fx "$file" "$TEMP_USED_CERTS" >/dev/null 2>&1; then
+      echo "$line" >> "$temp_unused"
+    fi
+  done
+
+  # Display unused certificates
+  if [ -s "$temp_unused" ]; then
+    display_info "Unused certificates and keys:"
+    nl -w2 -s". " "$temp_unused"
+  else
+    display_info "No unused certificates or keys found."
+  fi
+
+  rm -f "$temp_unused"
+}
+
+# Perform a complete machine audit
+complete_machine_audit() {
+  display_title "Complete Machine Audit"
+  > "$TEMP_AUDIT"
+
+  # Step 1: Detect services and their certificates
+  detect_services_443
+
+  # Step 2: Scan all certificates and keys
+  scan_all_certs
+
+  # Step 3: Compare used vs unused
+  compare_certs
+
+  # Step 4: Generate CSV-compatible summary
+  display_info "Generating audit summary for Excel..."
+  echo "Path,Type,Key Path,Expiration Date,Common Name,Issuer,Status" > "$TEMP_AUDIT"
+
+  # Process used certificates
+  if [ -s "$TEMP_USED_CERTS" ]; then
+    sort -u "$TEMP_USED_CERTS" | while IFS= read -r file; do
+      local type="Certificate"
+      local key_path="N/A"
+      local expiration="N/A"
+      local cn="N/A"
+      local issuer="N/A"
+      local status="Unknown"
+      if [[ "$file" == *.p12 ]]; then
+        type="PKCS#12"
+        if cert_data=$(openssl pkcs12 -in "$file" -nodes -nokeys -passin pass:"" 2>/dev/null); then
+          cn=$(echo "$cert_data" | openssl x509 -noout -subject 2>/dev/null | grep -oP 'CN=\K[^,]+')
+          issuer=$(echo "$cert_data" | openssl x509 -noout -issuer 2>/dev/null | grep -oP 'CN=\K[^,]+')
+          expiration=$(echo "$cert_data" | openssl x509 -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+          status=$(echo "$cert_data" | openssl x509 -noout -checkend 0 >/dev/null 2>&1 && echo "Valid" || echo "Expired")
+        fi
+      else
+        cn=$(openssl x509 -in "$file" -noout -subject 2>/dev/null | grep -oP 'CN=\K[^,]+')
+        issuer=$(openssl x509 -in "$file" -noout -issuer 2>/dev/null | grep -oP 'CN=\K[^,]+')
+        expiration=$(openssl x509 -in "$file" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+        status=$(openssl x509 -in "$file" -noout -checkend 0 >/dev/null 2>&1 && echo "Valid" || echo "Expired")
+        # Try to find associated key
+        local base_dir=$(dirname "$file")
+        local base_name=$(basename "$file" .crt | basename - .pem | basename - .cer)
+        key_path=$(find "$base_dir" -maxdepth 1 -name "$base_name.key" -o -name "*.key" | head -n 1)
+        [ -z "$key_path" ] && key_path="N/A"
+      fi
+      echo "$file,$type,$key_path,$expiration,$cn,$issuer,$status" >> "$TEMP_AUDIT"
+    done
+  fi
+
+  # Process all certificates (including unused)
+  if [ -s "$TEMP_ALL_CERTS" ]; then
+    sort -u "$TEMP_ALL_CERTS" | while IFS= read -r line; do
+      local file=$(echo "$line" | cut -d' ' -f1)
+      local type=$(echo "$line" | cut -d' ' -f2- | tr -d '()')
+      local key_path="N/A"
+      local expiration="N/A"
+      local cn="N/A"
+      local issuer="N/A"
+      local status="Unknown"
+      if [[ "$type" == "Private Key" ]]; then
+        key_path="$file"
+        type="Private Key"
+      elif [[ "$type" == "PKCS#12" ]]; then
+        if cert_data=$(openssl pkcs12 -in "$file" -nodes -nokeys -passin pass:"" 2>/dev/null); then
+          cn=$(echo "$cert_data" | openssl x509 -noout -subject 2>/dev/null | grep -oP 'CN=\K[^,]+')
+          issuer=$(echo "$cert_data" | openssl x509 -noout -issuer 2>/dev/null | grep -oP 'CN=\K[^,]+')
+          expiration=$(echo "$cert_data" | openssl x509 -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+          status=$(echo "$cert_data" | openssl x509 -noout -checkend 0 >/dev/null 2>&1 && echo "Valid" || echo "Expired")
+        fi
+      else
+        cn=$(openssl x509 -in "$file" -noout -subject 2>/dev/null | grep -oP 'CN=\K[^,]+')
+        issuer=$(openssl x509 -in "$file" -noout -issuer 2>/dev/null | grep -oP 'CN=\K[^,]+')
+        expiration=$(openssl x509 -in "$file" -noout -enddate 2>/dev/null | sed 's/notAfter=//')
+        status=$(openssl x509 -in "$file" -noout -checkend 0 >/dev/null 2>&1 && echo "Valid" || echo "Expired")
+        local base_dir=$(dirname "$file")
+        local base_name=$(basename "$file" .crt | basename - .pem | basename - .cer)
+        key_path=$(find "$base_dir" -maxdepth 1 -name "$base_name.key" -o -name "*.key" | head -n 1)
+        [ -z "$key_path" ] && key_path="N/A"
+      fi
+      # Only add if not already in used certs to avoid duplicates
+      if ! grep -Fx "$file" "$TEMP_USED_CERTS" >/dev/null 2>&1; then
+        echo "$file,$type,$key_path,$expiration,$cn,$issuer,$status" >> "$TEMP_AUDIT"
+      fi
+    done
+  fi
+
+  # Display summary
+  display_success "Audit complete. Summary saved to $TEMP_AUDIT"
+  display_info "CSV format for Excel:"
+  cat "$TEMP_AUDIT" | column -t -s,
+}
+
 # Display errors
 display_errors() {
   display_title "Files with Issues"
@@ -443,7 +702,8 @@ main_menu() {
     echo "7. Exit"
     echo "8. Services Web Locaux"
     echo "9. Certificats Distants (DNS/IP)"
-    read -p "Choice [1-9]: " choice
+    echo "11. Audit complet machine (Services + Certificats présents + Utilisés)"
+    read -p "Choice [1-9,11]: " choice
     case $choice in
       1)
         display_directories "$TEMP_SSL" "SSL/TLS"
@@ -482,8 +742,11 @@ main_menu() {
       9)
         scan_remote_cert
         ;;
+      11)
+        complete_machine_audit
+        ;;
       *)
-        display_error "Invalid choice. Please select 1-9."
+        display_error "Invalid choice. Please select 1-9 or 11."
         ;;
     esac
     read -p "Press Enter to continue..."
